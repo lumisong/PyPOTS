@@ -1,7 +1,7 @@
 Model API Cheatsheet
 =======================
 
-pypots.base module
+pypots.base
 ------------------
 
 .. automodule:: pypots.base
@@ -10,7 +10,7 @@ pypots.base module
    :show-inheritance:
    :inherited-members:
 
-pypots.imputation.base module
+pypots.imputation.base
 -----------------------------
 
 .. automodule:: pypots.imputation.base
@@ -19,7 +19,7 @@ pypots.imputation.base module
    :show-inheritance:
    :inherited-members:
 
-pypots.classification.base module
+pypots.classification.base
 ---------------------------------
 
 .. automodule:: pypots.classification.base
@@ -28,7 +28,25 @@ pypots.classification.base module
    :show-inheritance:
    :inherited-members:
 
-pypots.clustering.base module
+pypots.forecasting.base
+------------------------------
+
+.. automodule:: pypots.forecasting.base
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :inherited-members:
+
+pypots.anomaly_detection.base
+------------------------------
+
+.. automodule:: pypots.anomaly_detection.base
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :inherited-members:
+
+pypots.clustering.base
 -----------------------------
 
 .. automodule:: pypots.clustering.base
@@ -37,10 +55,10 @@ pypots.clustering.base module
    :show-inheritance:
    :inherited-members:
 
-pypots.forecasting.base module
+pypots.vec.base
 ------------------------------
 
-.. automodule:: pypots.forecasting.base
+.. automodule:: pypots.vec.base
    :members:
    :undoc-members:
    :show-inheritance:

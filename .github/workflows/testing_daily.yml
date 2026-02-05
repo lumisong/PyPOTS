@@ -4,67 +4,57 @@ on:
     schedule:
         # https://crontab.guru. Run everyday at 0:00AM UTC, i.e. 08:00AM Beijing, i.e. 08:00PM Montreal (summer time)
         - cron: "0 0 * * *"
+    push:
+        branches:
+            - temp_test_branch  # if in need, create such a temporary branch to test some functions
 
 jobs:
     Daily-testing:
         runs-on: ${{ matrix.os }}
         defaults:
             run:
-                shell: bash {0}
+                shell: bash -l {0}
         strategy:
             fail-fast: false
             matrix:
-                os: [ubuntu-latest, windows-latest, macOS-latest]
-                python-version: ["3.7", "3.8", "3.9", "3.10"]
-                torch-version: ["1.13.1"]
+                os: [ ubuntu-latest, windows-latest, macOS-latest ]
+                python-version: [ "3.9" ]
+                pytorch-version: ["2.3.0"]
 
         steps:
             - name: Check out the repo code
-              uses: actions/checkout@v3
+              uses: actions/checkout@v6
 
-            - name: Determine the Python version
-              uses: haya14busa/action-cond@v1
-              id: condval
+
+            - name: Set up Conda
+              uses: conda-incubator/setup-miniconda@v3
               with:
-                cond: ${{ matrix.python-version == 3.7 && matrix.os == 'macOS-latest' }}
-                # Note: the latest 3.7 subversion 3.7.17 for MacOS has "ModuleNotFoundError: No module named '_bz2'"
-                if_true: "3.7.16"
-                if_false: ${{ matrix.python-version }}
-
-            - name: Set up Python
-              uses: actions/setup-python@v4
-              with:
-                python-version: ${{ steps.condval.outputs.value }}
-                check-latest: true
-                cache: pip
-                cache-dependency-path: |
-                  setup.cfg
-
-            - name: Install PyTorch ${{ matrix.torch-version }}+cpu
-              # we have to install torch in advance because torch_sparse needs it for compilation,
-              # refer to https://github.com/rusty1s/pytorch_sparse/issues/156#issuecomment-1304869772 for details
-              run: |
-                  which python
-                  which pip
-                  python -m pip install --upgrade pip
-                  pip install torch==${{ matrix.torch-version }} -f https://download.pytorch.org/whl/cpu
-                  python -c "import torch; print('PyTorch:', torch.__version__)"
-
-            - name: Install other dependencies
-              run: |
-                  pip install pypots
-                  pip install torch-geometric torch-scatter torch-sparse -f "https://data.pyg.org/whl/torch-${{ matrix.torch-version }}+cpu.html"
-                  pip install -e ".[dev]"
+                  miniconda-version: "latest"
+                  activate-environment: pypots
+                  python-version: ${{ matrix.python-version }}
+                  environment-file: requirements/conda_dev_env.yml
+                  auto-activate-base: false
 
             - name: Fetch the test environment details
               run: |
+                  # many libs not compatible with numpy 2.0. Note 3.12 requests for numpy>=2.0. fix pandas version to avoid installing pandas 2.0, the same reason with numpy
+                  conda install -c conda-forge numpy=1.24 pandas=1.5
                   which python
-                  pip list
+                  conda info
+                  conda list
+
+            - name: Replace with the latest PyPOTS code for testing
+              run: |
+                  python_site_path=`python -c "import site; print(site.getsitepackages()[0])"`
+                  echo "python site-packages path: $python_site_path"
+                  rm -rf $python_site_path/pypots
+                  python -c "import shutil;import site;shutil.copytree('pypots',site.getsitepackages()[0]+'/pypots')"
 
             - name: Test with pytest
               run: |
-                  coverage run --source=pypots -m pytest --ignore tests/test_training_on_multi_gpus.py
-                  # ignore the test_training_on_multi_gpus.py because it requires multiple GPUs which are not available on GitHub Actions
+                  rm -rf testing_results && rm -rf tests/__pycache__ && rm -rf tests/*/__pycache__
+                  python tests/global_test_config.py
+                  python -m pytest -rA -s tests/*/* -n 1 --cov=pypots --dist=loadgroup --cov-config=.coveragerc
 
             - name: Generate the LCOV report
               run: |
@@ -72,6 +62,7 @@ jobs:
 
             - name: Submit the report
               uses: coverallsapp/github-action@master
+              continue-on-error: true
               with:
                   github-token: ${{ secrets.GITHUB_TOKEN }}
-                  path-to-lcov: "coverage.lcov"
+                  path-to-lcov: 'coverage.lcov'

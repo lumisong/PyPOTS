@@ -3,7 +3,7 @@ The base class for PyPOTS CLI (command line interface).
 """
 
 # Created by Wenjie Du <wenjay.du@gmail.com>
-# License: GLP-v3
+# License: BSD-3-Clause
 
 
 import os
@@ -69,8 +69,7 @@ class BaseCommand(ABC):
                 ".github",
                 "docs",
                 "pypots",
-                "setup.cfg",
-                "setup.py",
+                "pyproject.toml",
             }
         )
 

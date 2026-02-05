@@ -1,16 +1,25 @@
-pypots.data package
+pypots.data
 ===================
 
-pypots.data.base module
+pypots.data.dataset
 -----------------------
 
-.. automodule:: pypots.data.base
+.. automodule:: pypots.data.dataset
    :members:
    :undoc-members:
    :show-inheritance:
    :inherited-members:
 
-pypots.data.generating module
+pypots.data.saving
+-----------------------------
+
+.. automodule:: pypots.data.saving
+   :members:
+   :undoc-members:
+   :show-inheritance:
+   :inherited-members:
+
+pypots.data.generating
 -----------------------------
 
 .. automodule:: pypots.data.generating
@@ -19,16 +28,8 @@ pypots.data.generating module
    :show-inheritance:
    :inherited-members:
 
-pypots.data.load\_preprocessing module
---------------------------------------
 
-.. automodule:: pypots.data.load_preprocessing
-   :members:
-   :undoc-members:
-   :show-inheritance:
-   :inherited-members:
-
-pypots.data.load\_specific\_datasets module
+pypots.data.load\_specific\_datasets
 -------------------------------------------
 
 .. automodule:: pypots.data.load_specific_datasets
@@ -37,7 +38,7 @@ pypots.data.load\_specific\_datasets module
    :show-inheritance:
    :inherited-members:
 
-pypots.data.utils module
+pypots.data.utils
 ------------------------
 
 .. automodule:: pypots.data.utils

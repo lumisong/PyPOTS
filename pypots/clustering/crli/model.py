@@ -2,118 +2,31 @@
 The implementation of CRLI (Clustering Representation Learning on Incomplete time-series data) for
 the partially-observed time-series clustering task.
 
-Refer to the paper "Ma, Q., Chen, C., Li, S., & Cottrell, G. W. (2021).
-Learning Representations for Incomplete Time Series Clustering. AAAI 2021."
-
 """
 
 # Created by Wenjie Du <wenjay.du@gmail.com>
-# License: GLP-v3
+# License: BSD-3-Clause
 
+import os
+from copy import deepcopy
 from typing import Union, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.cluster import KMeans
 from torch.utils.data import DataLoader
 
+from .core import _CRLI
 from .data import DatasetForCRLI
-from .modules import Generator, Decoder, Discriminator
 from ..base import BaseNNClusterer
+from ...nn.modules.loss import Criterion
 from ...optim.adam import Adam
 from ...optim.base import Optimizer
 from ...utils.logging import logger
-from ...utils.metrics import cal_mse
 
-
-class _CRLI(nn.Module):
-    def __init__(
-        self,
-        n_steps: int,
-        n_features: int,
-        n_clusters: int,
-        n_generator_layers: int,
-        rnn_hidden_size: int,
-        decoder_fcn_output_dims: Optional[list],
-        lambda_kmeans: float,
-        rnn_cell_type: str = "GRU",
-        device: Union[str, torch.device] = "cpu",
-    ):
-        super().__init__()
-        self.generator = Generator(
-            n_generator_layers, n_features, rnn_hidden_size, rnn_cell_type, device
-        )
-        self.discriminator = Discriminator(rnn_cell_type, n_features, device)
-        self.decoder = Decoder(
-            n_steps, rnn_hidden_size * 2, n_features, decoder_fcn_output_dims, device
-        )  # fully connected network is included in Decoder
-        self.kmeans = KMeans(
-            n_clusters=n_clusters
-        )  # TODO: implement KMean with torch for gpu acceleration
-
-        self.n_clusters = n_clusters
-        self.lambda_kmeans = lambda_kmeans
-        self.device = device
-
-    def cluster(self, inputs: dict, training_object: str = "generator") -> dict:
-        # concat final states from generator and input it as the initial state of decoder
-        imputation, imputed_X, generator_fb_hidden_states = self.generator(inputs)
-        inputs["imputation"] = imputation
-        inputs["imputed_X"] = imputed_X
-        inputs["generator_fb_hidden_states"] = generator_fb_hidden_states
-        if training_object == "discriminator":
-            discrimination = self.discriminator(inputs)
-            inputs["discrimination"] = discrimination
-            return inputs  # if only train discriminator, then no need to run decoder
-
-        reconstruction, fcn_latent = self.decoder(inputs)
-        inputs["reconstruction"] = reconstruction
-        inputs["fcn_latent"] = fcn_latent
-        return inputs
-
-    def forward(
-        self,
-        inputs: dict,
-        training_object: str = "generator",
-        training: bool = True,
-    ) -> dict:
-        assert training_object in [
-            "generator",
-            "discriminator",
-        ], 'training_object should be "generator" or "discriminator"'
-
-        X = inputs["X"]
-        missing_mask = inputs["missing_mask"]
-        batch_size, n_steps, n_features = X.shape
-        losses = {}
-        inputs = self.cluster(inputs, training_object)
-        if not training:
-            # if only run clustering, then no need to calculate loss
-            return inputs
-
-        if training_object == "discriminator":
-            l_D = F.binary_cross_entropy_with_logits(
-                inputs["discrimination"], missing_mask
-            )
-            losses["discrimination_loss"] = l_D
-        else:
-            inputs["discrimination"] = inputs["discrimination"].detach()
-            l_G = F.binary_cross_entropy_with_logits(
-                inputs["discrimination"], 1 - missing_mask, weight=1 - missing_mask
-            )
-            l_pre = cal_mse(inputs["imputation"], X, missing_mask)
-            l_rec = cal_mse(inputs["reconstruction"], X, missing_mask)
-            HTH = torch.matmul(inputs["fcn_latent"], inputs["fcn_latent"].permute(1, 0))
-            term_F = torch.nn.init.orthogonal_(
-                torch.randn(batch_size, self.n_clusters, device=self.device), gain=1
-            )
-            FTHTHF = torch.matmul(torch.matmul(term_F.permute(1, 0), HTH), term_F)
-            l_kmeans = torch.trace(HTH) - torch.trace(FTHTHF)  # k-means loss
-            loss_gene = l_G + l_pre + l_rec + l_kmeans * self.lambda_kmeans
-            losses["generation_loss"] = loss_gene
-        return losses
+try:
+    import nni
+except ImportError:
+    pass
 
 
 class CRLI(BaseNNClusterer):
@@ -188,20 +101,15 @@ class CRLI(BaseNNClusterer):
         training into a tensorboard file). Will not save if not given.
 
     model_saving_strategy :
-        The strategy to save model checkpoints. It has to be one of [None, "best", "better"].
+        The strategy to save model checkpoints. It has to be one of [None, "best", "better", "all"].
         No model will be saved when it is set as None.
         The "best" strategy will only automatically save the best model after the training finished.
         The "better" strategy will automatically save the model during training whenever the model performs
         better than in previous epochs.
+        The "all" strategy will save every model after each epoch training.
 
-    Attributes
-    ----------
-    model : :class:`torch.nn.Module`
-        The underlying CRLI model.
-
-    optimizer : :class:`pypots.optim.Optimizer`
-        The optimizer for model training.
-
+    verbose :
+        Whether to print out the training logs during the training process.
     """
 
     def __init__(
@@ -219,23 +127,26 @@ class CRLI(BaseNNClusterer):
         batch_size: int = 32,
         epochs: int = 100,
         patience: Optional[int] = None,
-        G_optimizer: Optional[Optimizer] = Adam(),
-        D_optimizer: Optional[Optimizer] = Adam(),
+        G_optimizer: Union[Optimizer, type] = Adam,
+        D_optimizer: Union[Optimizer, type] = Adam,
         num_workers: int = 0,
         device: Optional[Union[str, torch.device, list]] = None,
         saving_path: Optional[str] = None,
         model_saving_strategy: Optional[str] = "best",
+        verbose: bool = True,
     ):
-
         super().__init__(
-            n_clusters,
-            batch_size,
-            epochs,
-            patience,
-            num_workers,
-            device,
-            saving_path,
-            model_saving_strategy,
+            n_clusters=n_clusters,
+            training_loss=Criterion,
+            validation_metric=Criterion,
+            batch_size=batch_size,
+            epochs=epochs,
+            patience=patience,
+            num_workers=num_workers,
+            device=device,
+            saving_path=saving_path,
+            model_saving_strategy=model_saving_strategy,
+            verbose=verbose,
         )
         assert G_steps > 0 and D_steps > 0, "G_steps and D_steps should both >0"
 
@@ -254,21 +165,38 @@ class CRLI(BaseNNClusterer):
             decoder_fcn_output_dims,
             lambda_kmeans,
             rnn_cell_type,
-            self.device,
         )
         self._send_model_to_given_device()
         self._print_model_size()
 
         # set up the optimizer
-        self.G_optimizer = G_optimizer
-        self.G_optimizer.init_optimizer(
-            [
-                {"params": self.model.generator.parameters()},
-                {"params": self.model.decoder.parameters()},
-            ]
-        )
-        self.D_optimizer = D_optimizer
-        self.D_optimizer.init_optimizer(self.model.discriminator.parameters())
+        if isinstance(G_optimizer, Optimizer):
+            self.G_optimizer = G_optimizer
+        else:
+            self.G_optimizer = G_optimizer()  # instantiate the optimizer if it is a class
+            assert isinstance(self.G_optimizer, Optimizer)
+        if isinstance(D_optimizer, Optimizer):
+            self.D_optimizer = D_optimizer
+        else:
+            self.D_optimizer = D_optimizer()  # instantiate the optimizer if it is a class
+            assert isinstance(self.D_optimizer, Optimizer)
+
+        if isinstance(self.device, list):
+            self.G_optimizer.init_optimizer(
+                [
+                    {"params": self.model.module.backbone.generator.parameters()},
+                    {"params": self.model.module.backbone.decoder.parameters()},
+                ]
+            )
+            self.D_optimizer.init_optimizer(self.model.module.backbone.discriminator.parameters())
+        else:
+            self.G_optimizer.init_optimizer(
+                [
+                    {"params": self.model.backbone.generator.parameters()},
+                    {"params": self.model.backbone.decoder.parameters()},
+                ]
+            )
+            self.D_optimizer.init_optimizer(self.model.backbone.discriminator.parameters())
 
     def _assemble_input_for_training(self, data: list) -> dict:
         # fetch data
@@ -289,20 +217,24 @@ class CRLI(BaseNNClusterer):
 
     def _train_model(
         self,
-        training_loader: DataLoader,
-        val_loader: DataLoader = None,
+        train_dataloader: DataLoader,
+        val_dataloader: DataLoader = None,
     ) -> None:
         # each training starts from the very beginning, so reset the loss and model dict here
-        self.best_loss = float("inf")
         self.best_model_dict = None
+
+        if self.validation_metric.lower_better:
+            self.best_loss = float("inf")
+        else:
+            self.best_loss = float("-inf")
 
         try:
             training_step = 0
             epoch_train_loss_G_collector = []
             epoch_train_loss_D_collector = []
-            for epoch in range(self.epochs):
+            for epoch in range(1, self.epochs + 1):
                 self.model.train()
-                for idx, data in enumerate(training_loader):
+                for idx, data in enumerate(train_dataloader):
                     training_step += 1
                     inputs = self._assemble_input_for_training(data)
 
@@ -310,25 +242,19 @@ class CRLI(BaseNNClusterer):
                     step_train_loss_D_collector = []
                     for _ in range(self.D_steps):
                         self.D_optimizer.zero_grad()
-                        results = self.model.forward(
-                            inputs, training_object="discriminator"
-                        )
-                        results["discrimination_loss"].backward(retain_graph=True)
+                        results = self.model(inputs, training_object="discriminator")
+                        discrimination_loss = results["discrimination_loss"].sum()
+                        discrimination_loss.backward(retain_graph=True)
                         self.D_optimizer.step()
-                        step_train_loss_D_collector.append(
-                            results["discrimination_loss"].item()
-                        )
+                        step_train_loss_D_collector.append(discrimination_loss.sum().item())
 
                     for _ in range(self.G_steps):
                         self.G_optimizer.zero_grad()
-                        results = self.model.forward(
-                            inputs, training_object="generator"
-                        )
-                        results["generation_loss"].backward()
+                        results = self.model(inputs, training_object="generator")
+                        generation_loss = results["generation_loss"].sum()
+                        generation_loss.backward()
                         self.G_optimizer.step()
-                        step_train_loss_G_collector.append(
-                            results["generation_loss"].item()
-                        )
+                        step_train_loss_G_collector.append(generation_loss.sum().item())
 
                     mean_step_train_D_loss = np.mean(step_train_loss_D_collector)
                     mean_step_train_G_loss = np.mean(step_train_loss_G_collector)
@@ -344,37 +270,75 @@ class CRLI(BaseNNClusterer):
                             "generation_loss": mean_step_train_G_loss,
                             "discrimination_loss": mean_step_train_D_loss,
                         }
-                        self._save_log_into_tb_file(
-                            training_step, "training", loss_results
-                        )
+                        self._save_log_into_tb_file(training_step, "training", loss_results)
+
                 mean_epoch_train_D_loss = np.mean(epoch_train_loss_D_collector)
                 mean_epoch_train_G_loss = np.mean(epoch_train_loss_G_collector)
-                logger.info(
-                    f"epoch {epoch}: "
-                    f"training loss_generator {mean_epoch_train_G_loss:.4f}, "
-                    f"train loss_discriminator {mean_epoch_train_D_loss:.4f}"
-                )
-                mean_loss = mean_epoch_train_G_loss
 
-                if mean_loss < self.best_loss:
-                    self.best_loss = mean_loss
-                    self.best_model_dict = self.model.state_dict()
-                    self.patience = self.original_patience
-                    # save the model if necessary
-                    self._auto_save_model_if_necessary(
-                        training_finished=False,
-                        saving_name=f"{self.__class__.__name__}_epoch{epoch}_loss{mean_loss}",
+                if val_dataloader is not None:
+                    self.model.eval()
+                    epoch_val_loss_G_collector = []
+                    with torch.no_grad():
+                        for idx, data in enumerate(val_dataloader):
+                            inputs = self._assemble_input_for_validating(data)
+                            results = self.model(inputs)
+                            generation_loss = results["generation_loss"]
+                            epoch_val_loss_G_collector.append(generation_loss.sum().item())
+                    mean_val_G_loss = np.mean(epoch_val_loss_G_collector)
+                    # save validation loss logs into the tensorboard file for every epoch if in need
+                    if self.summary_writer is not None:
+                        val_loss_dict = {
+                            "generation_loss": mean_val_G_loss,
+                        }
+                        self._save_log_into_tb_file(epoch, "validating", val_loss_dict)
+                    logger.info(
+                        f"Epoch {epoch:03d} - "
+                        f"generator training loss: {mean_epoch_train_G_loss:.4f}, "
+                        f"discriminator training loss: {mean_epoch_train_D_loss:.4f}, "
+                        f"generator validation loss: {mean_val_G_loss:.4f}"
                     )
+                    mean_loss = mean_val_G_loss
+                else:
+                    logger.info(
+                        f"Epoch {epoch:03d} - "
+                        f"generator training loss: {mean_epoch_train_G_loss:.4f}, "
+                        f"discriminator training loss: {mean_epoch_train_D_loss:.4f}"
+                    )
+                    mean_loss = mean_epoch_train_G_loss
+
+                if np.isnan(mean_loss):
+                    logger.warning(f"‼️ Attention: got NaN loss in Epoch {epoch}. This may lead to unexpected errors.")
+
+                if (self.validation_metric.lower_better and mean_loss < self.best_loss) or (
+                    not self.validation_metric.lower_better and mean_loss > self.best_loss
+                ):
+                    self.best_epoch = epoch
+                    self.best_loss = mean_loss
+                    self.best_model_dict = deepcopy(self.model.state_dict())
+                    self.patience = self.original_patience
                 else:
                     self.patience -= 1
-                    if self.patience == 0:
-                        logger.info(
-                            "Exceeded the training patience. Terminating the training procedure..."
-                        )
-                        break
-        except Exception as e:
-            logger.error(f"Exception: {e}")
-            if self.best_model_dict is None:
+
+                if os.getenv("ENABLE_HPO", False):
+                    nni.report_intermediate_result(mean_loss)
+                    if epoch == self.epochs - 1 or self.patience == 0:
+                        nni.report_final_result(self.best_loss)
+
+                # save the model if necessary
+                self._auto_save_model_if_necessary(
+                    confirm_saving=self.best_epoch == epoch and self.model_saving_strategy == "better",
+                    saving_name=f"{self.__class__.__name__}_epoch{epoch}_{self.validation_metric_name}{mean_loss:.4f}",
+                )
+
+                if self.patience == 0:
+                    logger.info("Exceeded the training patience. Terminating the training procedure...")
+                    break
+
+        except KeyboardInterrupt:  # if keyboard interrupt, only warning
+            logger.warning("‼️ Training got interrupted by the user. Exist now ...")
+        except Exception as e:  # other kind of exception follows below processing
+            logger.error(f"❌ Exception: {e}")
+            if self.best_model_dict is None:  # if no best model, raise error
                 raise RuntimeError(
                     "Training got interrupted. Model was not trained. Please investigate the error printed above."
                 )
@@ -385,57 +349,111 @@ class CRLI(BaseNNClusterer):
                     "If you don't want it, please try fit() again."
                 )
 
-        if np.equal(self.best_loss, float("inf")):
-            raise ValueError("Something is wrong. best_loss is Nan after training.")
+        if np.isnan(self.best_loss) or self.best_loss.__eq__(float("inf")):
+            raise ValueError("Something is wrong. best_loss is Nan/Inf after training.")
 
-        logger.info("Finished training.")
+        logger.info(f"Finished training. The best model is from epoch#{self.best_epoch}.")
 
     def fit(
         self,
         train_set: Union[dict, str],
-        file_type: str = "h5py",
+        val_set: Optional[Union[dict, str]] = None,
+        file_type: str = "hdf5",
     ) -> None:
         # Step 1: wrap the input data with classes Dataset and DataLoader
-        training_set = DatasetForCRLI(
-            train_set, return_labels=False, file_type=file_type
-        )
-        training_loader = DataLoader(
-            training_set,
+        train_dataset = DatasetForCRLI(train_set, return_y=False, file_type=file_type)
+        train_dataloader = DataLoader(
+            train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
         )
+        val_dataloader = None
+
+        if val_set is not None:
+            val_dataset = DatasetForCRLI(val_set, return_y=False, file_type=file_type)
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+            )
 
         # Step 2: train the model and freeze it
-        self._train_model(training_loader)
+        self._train_model(train_dataloader, val_dataloader)
         self.model.load_state_dict(self.best_model_dict)
-        self.model.eval()  # set the model as eval status to freeze it.
 
         # Step 3: save the model if necessary
-        self._auto_save_model_if_necessary(training_finished=True)
+        self._auto_save_model_if_necessary(confirm_saving=self.model_saving_strategy == "best")
 
-    def cluster(
+    @torch.no_grad()
+    def predict(
         self,
-        X: Union[dict, str],
-        file_type: str = "h5py",
-    ) -> np.ndarray:
-        self.model.eval()  # set the model as eval status to freeze it.
-        test_set = DatasetForCRLI(X, return_labels=False, file_type=file_type)
-        test_loader = DataLoader(
+        test_set: Union[dict, str],
+        file_type: str = "hdf5",
+        return_latent_vars: bool = False,
+    ) -> dict:
+        """Make predictions for the input data with the trained model.
+
+        Parameters
+        ----------
+        test_set :
+            The test dataset for model to process, should be a dictionary including keys as 'X',
+            or a path string locating a data file supported by PyPOTS (e.g. h5 file).
+            If it is a dict, X should be array-like with shape [n_samples, n_steps, n_features],
+            which is the time-series data for processing.
+            If it is a path string, the path should point to a data file, e.g. a h5 file, which contains
+            key-value pairs like a dict, and it has to include 'X' key.
+
+        file_type :
+            The type of the given file if test_set is a path string.
+
+        return_latent_vars : bool
+            Whether to return the latent variables in VaDER, e.g. mu and phi, etc.
+
+        Returns
+        -------
+        result_dict :
+            The dictionary containing the clustering results as key 'clustering' and latent variables if necessary.
+        """
+        self.model.eval()  # set the model to evaluation mode
+        test_dataset = DatasetForCRLI(
             test_set,
+            return_y=False,
+            file_type=file_type,
+        )
+        test_dataloader = DataLoader(
+            test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
         )
-        latent_collector = []
+        clustering_latent_collector = []
+        imputation_collector = []
 
-        with torch.no_grad():
-            for idx, data in enumerate(test_loader):
-                inputs = self._assemble_input_for_testing(data)
-                inputs = self.model.forward(inputs, training=False)
-                latent_collector.append(inputs["fcn_latent"])
+        for idx, data in enumerate(test_dataloader):
+            inputs = self._assemble_input_for_testing(data)
+            inputs = self.model(inputs)
+            clustering_latent_collector.append(inputs["fcn_latent"])
+            if return_latent_vars:
+                imputation_collector.append(inputs["imputation_latent"])
 
-        latent_collector = torch.cat(latent_collector).cpu().detach().numpy()
-        clustering = self.model.kmeans.fit_predict(latent_collector)
+        clustering_latent = torch.cat(clustering_latent_collector).cpu().detach().numpy()
+        if isinstance(self.device, list):
+            clustering = self.model.module.kmeans.fit_predict(clustering_latent)
+        else:
+            clustering = self.model.kmeans.fit_predict(clustering_latent)
 
-        return clustering
+        result_dict = {
+            "clustering": clustering,
+        }
+
+        if return_latent_vars:
+            imputation = torch.cat(imputation_collector).cpu().detach().numpy()
+            latent_var_collector = {
+                "clustering_latent": clustering_latent,
+                "imputation_latent": imputation,
+            }
+            result_dict["latent_vars"] = latent_var_collector
+
+        return result_dict

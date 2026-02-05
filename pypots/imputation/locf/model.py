@@ -4,130 +4,83 @@ The implementation of LOCF (Last Observed Carried Forward) for the partially-obs
 """
 
 # Created by Wenjie Du <wenjay.du@gmail.com>
-# License: GLP-v3
+# License: BSD-3-Clause
 
 import warnings
 from typing import Union, Optional
 
+import h5py
 import numpy as np
 import torch
 
+from .core import locf_numpy, locf_torch
 from ..base import BaseImputer
 
 
 class LOCF(BaseImputer):
-    """LOCF (Last Observed Carried Forward) imputation method.
-    A naive imputation method that fills missing values with the last observed value.
-    Simple but commonly used in practice.
+    """LOCF (Last Observed Carried Forward) imputation method. A naive imputation method that fills missing values
+    with the last observed value. When time-series data gets inverse on the time dimension, this method can also be
+    seen as NOCB (Next Observation Carried Backward). Simple but commonly used in practice.
 
     Parameters
     ----------
-    nan : float, default=0,
-        The value used to impute data missing at the beginning of the sequence.
+    first_step_imputation : str, default='backward'
+        With LOCF, the observed values are carried forward to impute the missing ones. But if the first value
+        is missing, there is no value to carry forward. This parameter is used to determine the strategy to
+        impute the missing values at the beginning of the time-series sequence after LOCF is applied.
+        It can be one of ['backward', 'zero', 'median', 'nan'].
+        If 'nan', the missing values at the sequence beginning will be left as NaNs.
+        If 'zero', the missing values at the sequence beginning will be imputed with 0.
+        If 'backward', the missing values at the beginning of the time-series sequence will be imputed with the
+        first observed value in the sequence, i.e. the first observed value will be carried backward to impute
+        the missing values at the beginning of the sequence. This method is also known as NOCB (Next Observation
+        Carried Backward). If 'median', the missing values at the sequence beginning will be imputed with the overall
+        median values of features in the dataset.
+        If `first_step_imputation` is not "nan", if missing values still exist (this is usually caused by whole feature
+        missing) after applying `first_step_imputation`, they will be filled with 0.
+
     """
 
-    def __init__(self, nan: Optional[Union[float, int]] = 0):
-        super().__init__("cpu")
-        self.nan = nan
+    def __init__(
+        self,
+        first_step_imputation: str = "zero",
+        device: Optional[Union[str, torch.device, list]] = None,
+    ):
+        super().__init__(device=device)
+        assert first_step_imputation in ["nan", "zero", "backward", "median"]
+        self.first_step_imputation = first_step_imputation
 
     def fit(
         self,
         train_set: Union[dict, str],
         val_set: Optional[Union[dict, str]] = None,
-        file_type: str = "h5py",
+        file_type: str = "hdf5",
     ) -> None:
         """Train the imputer on the given data.
 
         Warnings
         --------
         LOCF does not need to run fit().
-        Please run func ``impute()`` directly.
+        Please run func ``predict()`` directly.
 
         """
         warnings.warn(
             "LOCF (Last Observed Carried Forward) imputation class has no parameter to train. "
-            "Please run func impute(X) directly."
+            "Please run func `predict()` directly."
         )
 
-    def _locf_numpy(self, X: np.ndarray) -> np.ndarray:
-        """Numpy implementation of LOCF.
-
-        Parameters
-        ----------
-        X : np.ndarray,
-            Time series containing missing values (NaN) to be imputed.
-
-        Returns
-        -------
-        X_imputed : array,
-            Imputed time series.
-
-        Notes
-        -----
-        This implementation gets inspired by the question on StackOverflow:
-        https://stackoverflow.com/questions/41190852/most-efficient-way-to-forward-fill-nan-values-in-numpy-array
-
-        """
-        trans_X = X.transpose((0, 2, 1))
-        mask = np.isnan(trans_X)
-        n_samples, n_steps, n_features = mask.shape
-        idx = np.where(~mask, np.arange(n_features), 0)
-        np.maximum.accumulate(idx, axis=2, out=idx)
-
-        collector = []
-        for x, i in zip(trans_X, idx):
-            collector.append(x[np.arange(n_steps)[:, None], i])
-        X_imputed = np.asarray(collector)
-        X_imputed = X_imputed.transpose((0, 2, 1))
-
-        # If there are values still missing,
-        # they are missing at the beginning of the time-series sequence.
-        # Impute them with self.nan
-        if np.isnan(X_imputed).any():
-            X_imputed = np.nan_to_num(X_imputed, nan=self.nan)
-
-        return X_imputed
-
-    def _locf_torch(self, X: torch.Tensor) -> torch.Tensor:
-        """Torch implementation of LOCF.
-
-        Parameters
-        ----------
-        X : tensor,
-            Time series containing missing values (NaN) to be imputed.
-
-        Returns
-        -------
-        X_imputed : tensor,
-            Imputed time series.
-        """
-        trans_X = X.permute((0, 2, 1))
-        mask = torch.isnan(trans_X)
-        n_samples, n_steps, n_features = mask.shape
-        idx = torch.where(~mask, torch.arange(n_features, device=mask.device), 0)
-        idx = torch.cummax(idx, dim=2)
-
-        collector = []
-        for x, i in zip(trans_X, idx):
-            collector.append(x[torch.arange(n_steps)[:, None], i])
-        X_imputed = torch.concat(collector, dim=0)
-        X_imputed = X_imputed.permute((0, 2, 1))
-
-        # If there are values still missing,
-        # they are missing at the beginning of the time-series sequence.
-        # Impute them with self.nan
-        if torch.isnan(X_imputed).any():
-            X_imputed = torch.nan_to_num(X_imputed, nan=self.nan)
-
-        return X_imputed
-
-    def impute(
+    def predict(
         self,
-        X: Union[dict, str],
-        file_type: str = "h5py",
-    ) -> np.ndarray:
-        assert not isinstance(X, str)
-        X = X["X"]
+        test_set: Union[dict, str],
+        file_type: str = "hdf5",
+        **kwargs,
+    ) -> dict:
+
+        if isinstance(test_set, str):
+            with h5py.File(test_set, "r") as f:
+                X = f["X"][:]
+        else:
+            X = test_set["X"]
 
         assert len(X.shape) == 3, (
             f"Input X should have 3 dimensions [n_samples, n_steps, n_features], "
@@ -137,12 +90,13 @@ class LOCF(BaseImputer):
             X = np.asarray(X)
 
         if isinstance(X, np.ndarray):
-            imputed_data = self._locf_numpy(X)
+            imputed_data = locf_numpy(X, self.first_step_imputation)
         elif isinstance(X, torch.Tensor):
-            imputed_data = self._locf_torch(X).detach().cpu().numpy()
+            imputed_data = locf_torch(X, self.first_step_imputation)
         else:
-            raise TypeError(
-                "X must be type of list/np.ndarray/torch.Tensor, " f"but got {type(X)}"
-            )
+            raise TypeError("X must be type of list/np.ndarray/torch.Tensor, " f"but got {type(X)}")
 
-        return imputed_data
+        result_dict = {
+            "imputation": imputed_data,
+        }
+        return result_dict

@@ -1,109 +1,25 @@
 """
-PyTorch MRNN model for the time-series imputation task.
-Some part of the code is from https://github.com/WenjieDu/SAITS.
+PyTorch M-RNN model for the time-series imputation task.
 
 """
 
 # Created by Wenjie Du <wenjay.du@gmail.com>
-# License: GLP-v3
+# License: BSD-3-Clause
 
 
 from typing import Union, Optional
 
-import h5py
-import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from .core import _MRNN
 from .data import DatasetForMRNN
-from .module import FCN_Regression
 from ..base import BaseNNImputer
+from ...data.checking import key_in_data_set
+from ...nn.functional import gather_listed_dicts
+from ...nn.modules.loss import Criterion, RMSE, MSE
 from ...optim.adam import Adam
 from ...optim.base import Optimizer
-from ...utils.metrics import cal_rmse
-
-
-class _MRNN(nn.Module):
-    def __init__(self, seq_len, feature_num, rnn_hidden_size, device):
-        super().__init__()
-        # data settings
-        self.seq_len = seq_len
-        self.feature_num = feature_num
-        self.rnn_hidden_size = rnn_hidden_size
-        self.device = device
-
-        self.f_rnn = nn.GRUCell(self.feature_num * 3, self.rnn_hidden_size)
-        self.b_rnn = nn.GRUCell(self.feature_num * 3, self.rnn_hidden_size)
-        self.concated_hidden_project = nn.Linear(
-            self.rnn_hidden_size * 2, self.feature_num
-        )
-        self.fcn_regression = FCN_Regression(feature_num, rnn_hidden_size)
-
-    def gene_hidden_states(self, inputs, direction):
-        X = inputs[direction]["X"]
-        masks = inputs[direction]["missing_mask"]
-        deltas = inputs[direction]["deltas"]
-        device = X.device
-
-        hidden_states_collector = []
-        hidden_state = torch.zeros((X.size()[0], self.rnn_hidden_size), device=device)
-
-        for t in range(self.seq_len):
-            x = X[:, t, :]
-            m = masks[:, t, :]
-            d = deltas[:, t, :]
-            inputs = torch.cat([x, m, d], dim=1)
-            if direction == "forward":
-                hidden_state = self.f_rnn(inputs, hidden_state)
-            else:
-                hidden_state = self.b_rnn(inputs, hidden_state)
-            hidden_states_collector.append(hidden_state)
-        return hidden_states_collector
-
-    def forward(self, inputs, training=True):
-        hidden_states_f = self.gene_hidden_states(inputs, "forward")
-        hidden_states_b = self.gene_hidden_states(inputs, "backward")[::-1]
-
-        X = inputs["forward"]["X"]
-        masks = inputs["forward"]["missing_mask"]
-
-        reconstruction_loss = 0
-        estimations = []
-        for i in range(
-            self.seq_len
-        ):  # calculating estimation loss for times can obtain better results than once
-            x = X[:, i, :]
-            m = masks[:, i, :]
-            h_f = hidden_states_f[i]
-            h_b = hidden_states_b[i]
-            h = torch.cat([h_f, h_b], dim=1)
-            RNN_estimation = self.concated_hidden_project(h)  # x̃_t
-            RNN_imputed_data = m * x + (1 - m) * RNN_estimation
-            FCN_estimation = self.fcn_regression(
-                x, m, RNN_imputed_data
-            )  # FCN estimation is output estimation
-            reconstruction_loss += cal_rmse(FCN_estimation, x, m) + cal_rmse(
-                RNN_estimation, x, m
-            )
-            estimations.append(FCN_estimation.unsqueeze(dim=1))
-
-        estimations = torch.cat(estimations, dim=1)
-        imputed_data = masks * X + (1 - masks) * estimations
-
-        if not training:
-            # if not in training mode, return the classification result only
-            return {
-                "imputed_data": imputed_data,
-            }
-
-        reconstruction_loss /= self.seq_len
-
-        ret_dict = {
-            "loss": reconstruction_loss,
-            "imputed_data": imputed_data,
-        }
-        return ret_dict
 
 
 class MRNN(BaseNNImputer):
@@ -111,6 +27,12 @@ class MRNN(BaseNNImputer):
 
     Parameters
     ----------
+    n_steps :
+        The number of time steps in the time-series data sample.
+
+    n_features :
+        The number of features in the time-series data sample.
+
     rnn_hidden_size :
         The size of the RNN hidden state, also the number of hidden units in the RNN cell.
 
@@ -124,6 +46,14 @@ class MRNN(BaseNNImputer):
         The patience for the early-stopping mechanism. Given a positive integer, the training process will be
         stopped when the model does not perform better after that number of epochs.
         Leaving it default as None will disable the early-stopping.
+
+    training_loss:
+        The customized loss function designed by users for training the model.
+        If not given, will use the default loss as claimed in the original paper.
+
+    validation_metric:
+        The customized metric function designed by users for validating the model.
+        If not given, will use the default MSE metric.
 
     optimizer :
         The optimizer for model training.
@@ -146,20 +76,15 @@ class MRNN(BaseNNImputer):
         training into a tensorboard file). Will not save if not given.
 
     model_saving_strategy :
-        The strategy to save model checkpoints. It has to be one of [None, "best", "better"].
+        The strategy to save model checkpoints. It has to be one of [None, "best", "better", "all"].
         No model will be saved when it is set as None.
         The "best" strategy will only automatically save the best model after the training finished.
         The "better" strategy will automatically save the model during training whenever the model performs
         better than in previous epochs.
+        The "all" strategy will save every model after each epoch training.
 
-    Attributes
-    ----------
-    model : :class:`torch.nn.Module`
-        The underlying BRITS model.
-
-    optimizer : :class:`pypots.optim.Optimizer`
-        The optimizer for model training.
-
+    verbose :
+        Whether to print out the training logs during the training process.
     """
 
     def __init__(
@@ -169,39 +94,49 @@ class MRNN(BaseNNImputer):
         rnn_hidden_size: int,
         batch_size: int = 32,
         epochs: int = 100,
-        patience: int = None,
-        optimizer: Optional[Optimizer] = Adam(),
+        patience: Optional[int] = None,
+        training_loss: Union[Criterion, type] = RMSE,
+        validation_metric: Union[Criterion, type] = MSE,
+        optimizer: Union[Optimizer, type] = Adam,
         num_workers: int = 0,
         device: Optional[Union[str, torch.device, list]] = None,
         saving_path: str = None,
         model_saving_strategy: Optional[str] = "best",
+        verbose: bool = True,
     ):
         super().__init__(
-            batch_size,
-            epochs,
-            patience,
-            num_workers,
-            device,
-            saving_path,
-            model_saving_strategy,
+            training_loss=training_loss,
+            validation_metric=validation_metric,
+            batch_size=batch_size,
+            epochs=epochs,
+            patience=patience,
+            num_workers=num_workers,
+            device=device,
+            saving_path=saving_path,
+            model_saving_strategy=model_saving_strategy,
+            verbose=verbose,
         )
-
         self.n_steps = n_steps
         self.n_features = n_features
         self.rnn_hidden_size = rnn_hidden_size
 
         # set up the model
         self.model = _MRNN(
-            self.n_steps,
-            self.n_features,
-            self.rnn_hidden_size,
-            self.device,
+            n_steps=self.n_steps,
+            n_features=self.n_features,
+            rnn_hidden_size=self.rnn_hidden_size,
+            training_loss=self.training_loss,
+            validation_metric=self.validation_metric,
         )
         self._send_model_to_given_device()
         self._print_model_size()
 
         # set up the optimizer
-        self.optimizer = optimizer
+        if isinstance(optimizer, Optimizer):
+            self.optimizer = optimizer
+        else:
+            self.optimizer = optimizer()  # instantiate the optimizer if it is a class
+            assert isinstance(self.optimizer, Optimizer)
         self.optimizer.init_optimizer(self.model.parameters())
 
     def _assemble_input_for_training(self, data: list) -> dict:
@@ -234,79 +169,102 @@ class MRNN(BaseNNImputer):
         return inputs
 
     def _assemble_input_for_validating(self, data: list) -> dict:
-        return self._assemble_input_for_training(data)
+        # fetch data
+        (
+            indices,
+            X,
+            missing_mask,
+            deltas,
+            back_X,
+            back_missing_mask,
+            back_deltas,
+            X_ori,
+            indicating_mask,
+        ) = self._send_data_to_given_device(data)
+
+        # assemble input data
+        inputs = {
+            "indices": indices,
+            "forward": {
+                "X": X,
+                "missing_mask": missing_mask,
+                "deltas": deltas,
+            },
+            "backward": {
+                "X": back_X,
+                "missing_mask": back_missing_mask,
+                "deltas": back_deltas,
+            },
+            "X_ori": X_ori,
+            "indicating_mask": indicating_mask,
+        }
+
+        return inputs
 
     def _assemble_input_for_testing(self, data: list) -> dict:
-        return self._assemble_input_for_validating(data)
+        return self._assemble_input_for_training(data)
 
     def fit(
         self,
         train_set: Union[dict, str],
         val_set: Optional[Union[dict, str]] = None,
-        file_type: str = "h5py",
+        file_type: str = "hdf5",
     ) -> None:
         # Step 1: wrap the input data with classes Dataset and DataLoader
-        training_set = DatasetForMRNN(
-            train_set, return_labels=False, file_type=file_type
-        )
-        training_loader = DataLoader(
-            training_set,
+        train_dataset = DatasetForMRNN(train_set, return_X_ori=False, return_y=False, file_type=file_type)
+        train_dataloader = DataLoader(
+            train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
         )
-        val_loader = None
+        val_dataloader = None
         if val_set is not None:
-            if isinstance(val_set, str):
-                with h5py.File(val_set, "r") as hf:
-                    # Here we read the whole validation set from the file to mask a portion for validation.
-                    # In PyPOTS, using a file usually because the data is too big. However, the validation set is
-                    # generally shouldn't be too large. For example, we have 1 billion samples for model training.
-                    # We won't take 20% of them as the validation set because we want as much as possible data for the
-                    # training stage to enhance the model's generalization ability. Therefore, 100,000 representative
-                    # samples will be enough to validate the model.
-                    val_set = {
-                        "X": hf["X"][:],
-                        "X_intact": hf["X_intact"][:],
-                        "indicating_mask": hf["indicating_mask"][:],
-                    }
-            val_set = DatasetForMRNN(val_set, return_labels=False, file_type=file_type)
-            val_loader = DataLoader(
-                val_set,
+            if not key_in_data_set("X_ori", val_set):
+                raise ValueError("val_set must contain 'X_ori' for model validation.")
+            val_dataset = DatasetForMRNN(val_set, return_X_ori=True, return_y=False, file_type=file_type)
+            val_dataloader = DataLoader(
+                val_dataset,
                 batch_size=self.batch_size,
                 shuffle=False,
                 num_workers=self.num_workers,
             )
 
         # Step 2: train the model and freeze it
-        self._train_model(training_loader, val_loader)
+        self._train_model(train_dataloader, val_dataloader)
         self.model.load_state_dict(self.best_model_dict)
-        self.model.eval()  # set the model as eval status to freeze it.
 
         # Step 3: save the model if necessary
-        self._auto_save_model_if_necessary(training_finished=True)
+        self._auto_save_model_if_necessary(confirm_saving=self.model_saving_strategy == "best")
 
-    def impute(
+    @torch.no_grad()
+    def predict(
         self,
-        X: Union[dict, str],
-        file_type="h5py",
-    ) -> np.ndarray:
-        self.model.eval()  # set the model as eval status to freeze it.
-        test_set = DatasetForMRNN(X, return_labels=False, file_type=file_type)
-        test_loader = DataLoader(
+        test_set: Union[dict, str],
+        file_type: str = "hdf5",
+    ) -> dict:
+        self.model.eval()  # set the model to evaluation mode
+        test_dataset = DatasetForMRNN(
             test_set,
+            return_X_ori=False,
+            return_y=False,
+            file_type=file_type,
+        )
+        test_dataloader = DataLoader(
+            test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
         )
-        imputation_collector = []
 
-        with torch.no_grad():
-            for idx, data in enumerate(test_loader):
-                inputs = self._assemble_input_for_testing(data)
-                results = self.model.forward(inputs, training=False)
-                imputed_data = results["imputed_data"]
-                imputation_collector.append(imputed_data)
+        # Step 2: process the data with the model
+        dict_result_collector = []
+        for idx, data in enumerate(test_dataloader):
+            inputs = self._assemble_input_for_testing(data)
+            results = self.model(inputs)
+            dict_result_collector.append(results)
 
-        imputation_collector = torch.cat(imputation_collector)
-        return imputation_collector.cpu().detach().numpy()
+        # Step 3: output collection and return
+        result_dict = gather_listed_dicts(dict_result_collector)
+
+        return result_dict

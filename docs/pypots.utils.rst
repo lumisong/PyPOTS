@@ -1,25 +1,25 @@
-pypots.utils package
+pypots.utils
 ====================
 
-pypots.utils.files module
+pypots.utils.file
 -------------------------
 
-.. automodule:: pypots.utils.files
+.. automodule:: pypots.utils.file
    :members:
    :undoc-members:
    :show-inheritance:
    :inherited-members:
 
-pypots.utils.metrics module
+pypots.nn.functional
 ---------------------------
 
-.. automodule:: pypots.utils.metrics
+.. automodule:: pypots.nn.functional
    :members:
    :undoc-members:
    :show-inheritance:
    :inherited-members:
 
-pypots.utils.random module
+pypots.utils.random
 --------------------------
 
 .. automodule:: pypots.utils.random

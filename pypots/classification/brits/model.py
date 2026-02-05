@@ -1,115 +1,24 @@
 """
 The implementation of BRITS for the partially-observed time-series classification task.
 
-Refer to the paper "Cao, W., Wang, D., Li, J., Zhou, H., Li, L., & Li, Y. (2018).
-BRITS: Bidirectional Recurrent Imputation for Time Series. NeurIPS 2018."
-
-Notes
------
-Partial implementation uses code from https://github.com/caow13/BRITS. The bugs in the original implementation
-are fixed here.
-
 """
 
 # Created by Wenjie Du <wenjay.du@gmail.com>
-# License: GPL-v3
+# License: BSD-3-Clause
 
 from typing import Optional, Union
 
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .data import DatasetForBRITS
-from .modules import RITS
+from .core import _BRITS
 from ..base import BaseNNClassifier
-from ...imputation.brits.model import (
-    _BRITS as imputation_BRITS,
-)
+from ...imputation.brits.data import DatasetForBRITS
+from ...nn.functional import gather_listed_dicts
+from ...nn.modules.loss import Criterion, CrossEntropy
 from ...optim.adam import Adam
 from ...optim.base import Optimizer
-
-
-class _BRITS(imputation_BRITS, nn.Module):
-    def __init__(
-        self,
-        n_steps: int,
-        n_features: int,
-        rnn_hidden_size: int,
-        n_classes: int,
-        classification_weight: float,
-        reconstruction_weight: float,
-        device: Union[str, torch.device],
-    ):
-        super().__init__(n_steps, n_features, rnn_hidden_size, device)
-        self.n_steps = n_steps
-        self.n_features = n_features
-        self.rnn_hidden_size = rnn_hidden_size
-        self.n_classes = n_classes
-
-        # create models
-        self.rits_f = RITS(n_steps, n_features, rnn_hidden_size, n_classes, device)
-        self.rits_b = RITS(n_steps, n_features, rnn_hidden_size, n_classes, device)
-        self.classification_weight = classification_weight
-        self.reconstruction_weight = reconstruction_weight
-
-    def impute(self, inputs: dict) -> torch.Tensor:
-        return super().impute(inputs)
-
-    def forward(self, inputs: dict, training: bool = True) -> dict:
-        """Forward processing of BRITS.
-
-        Parameters
-        ----------
-        inputs :
-            The input data.
-
-        training :
-            Whether in training mode.
-
-        Returns
-        -------
-        dict, A dictionary includes all results.
-        """
-        ret_f = self.rits_f(inputs, "forward")
-        ret_b = self._reverse(self.rits_b(inputs, "backward"))
-
-        classification_pred = (ret_f["prediction"] + ret_b["prediction"]) / 2
-        if not training:
-            # if not in training mode, return the classification result only
-            return {"classification_pred": classification_pred}
-
-        ret_f["classification_loss"] = F.nll_loss(
-            torch.log(ret_f["prediction"]), inputs["label"]
-        )
-        ret_b["classification_loss"] = F.nll_loss(
-            torch.log(ret_b["prediction"]), inputs["label"]
-        )
-        consistency_loss = self._get_consistency_loss(
-            ret_f["imputed_data"], ret_b["imputed_data"]
-        )
-        classification_loss = (
-            ret_f["classification_loss"] + ret_b["classification_loss"]
-        ) / 2
-        reconstruction_loss = (
-            ret_f["reconstruction_loss"] + ret_b["reconstruction_loss"]
-        ) / 2
-
-        loss = (
-            consistency_loss
-            + reconstruction_loss * self.reconstruction_weight
-            + classification_loss * self.classification_weight
-        )
-
-        results = {
-            "classification_pred": classification_pred,
-            "consistency_loss": consistency_loss,
-            "classification_loss": classification_loss,
-            "reconstruction_loss": reconstruction_loss,
-            "loss": loss,
-        }
-        return results
 
 
 class BRITS(BaseNNClassifier):
@@ -146,6 +55,14 @@ class BRITS(BaseNNClassifier):
         stopped when the model does not perform better after that number of epochs.
         Leaving it default as None will disable the early-stopping.
 
+    training_loss:
+        The customized loss function designed by users for training the model.
+        If not given, will use the default loss as claimed in the original paper.
+
+    validation_metric:
+        The customized metric function designed by users for validating the model.
+        If not given, will use the default loss from the original paper as the metric.
+
     optimizer :
         The optimizer for model training.
         If not given, will use a default Adam optimizer.
@@ -167,20 +84,15 @@ class BRITS(BaseNNClassifier):
         training into a tensorboard file). Will not save if not given.
 
     model_saving_strategy :
-        The strategy to save model checkpoints. It has to be one of [None, "best", "better"].
+        The strategy to save model checkpoints. It has to be one of [None, "best", "better", "all"].
         No model will be saved when it is set as None.
         The "best" strategy will only automatically save the best model after the training finished.
         The "better" strategy will automatically save the model during training whenever the model performs
         better than in previous epochs.
+        The "all" strategy will save every model after each epoch training.
 
-    Attributes
-    ----------
-    model : :class:`torch.nn.Module`
-        The underlying BRITS model.
-
-    optimizer : :class:`pypots.optim.Optimizer`
-        The optimizer for model training.
-
+    verbose :
+        Whether to print out the training logs during the training process.
     """
 
     def __init__(
@@ -193,22 +105,28 @@ class BRITS(BaseNNClassifier):
         reconstruction_weight: float = 1,
         batch_size: int = 32,
         epochs: int = 100,
-        patience: int = None,
-        optimizer: Optional[Optimizer] = Adam(),
+        patience: Optional[int] = None,
+        training_loss: Union[Criterion, type] = CrossEntropy,
+        validation_metric: Union[Criterion, type] = CrossEntropy,
+        optimizer: Union[Optimizer, type] = Adam,
         num_workers: int = 0,
         device: Optional[Union[str, torch.device, list]] = None,
         saving_path: str = None,
         model_saving_strategy: Optional[str] = "best",
+        verbose: bool = True,
     ):
         super().__init__(
-            n_classes,
-            batch_size,
-            epochs,
-            patience,
-            num_workers,
-            device,
-            saving_path,
-            model_saving_strategy,
+            n_classes=n_classes,
+            training_loss=training_loss,
+            validation_metric=validation_metric,
+            batch_size=batch_size,
+            epochs=epochs,
+            patience=patience,
+            num_workers=num_workers,
+            device=device,
+            saving_path=saving_path,
+            model_saving_strategy=model_saving_strategy,
+            verbose=verbose,
         )
 
         self.n_steps = n_steps
@@ -219,22 +137,27 @@ class BRITS(BaseNNClassifier):
 
         # set up the model
         self.model = _BRITS(
-            self.n_steps,
-            self.n_features,
-            self.rnn_hidden_size,
-            self.n_classes,
-            self.classification_weight,
-            self.reconstruction_weight,
-            self.device,
+            n_steps=self.n_steps,
+            n_features=self.n_features,
+            rnn_hidden_size=self.rnn_hidden_size,
+            n_classes=self.n_classes,
+            classification_weight=self.classification_weight,
+            reconstruction_weight=self.reconstruction_weight,
+            training_loss=self.training_loss,
+            validation_metric=self.validation_metric,
         )
         self._send_model_to_given_device()
         self._print_model_size()
 
         # set up the optimizer
-        self.optimizer = optimizer
+        if isinstance(optimizer, Optimizer):
+            self.optimizer = optimizer
+        else:
+            self.optimizer = optimizer()  # instantiate the optimizer if it is a class
+            assert isinstance(self.optimizer, Optimizer)
         self.optimizer.init_optimizer(self.model.parameters())
 
-    def _assemble_input_for_training(self, data: dict) -> dict:
+    def _assemble_input_for_training(self, data: list) -> dict:
         # fetch data
         (
             indices,
@@ -244,13 +167,13 @@ class BRITS(BaseNNClassifier):
             back_X,
             back_missing_mask,
             back_deltas,
-            label,
+            y,
         ) = self._send_data_to_given_device(data)
 
         # assemble input data
         inputs = {
             "indices": indices,
-            "label": label,
+            "y": y,
             "forward": {
                 "X": X,
                 "missing_mask": missing_mask,
@@ -264,10 +187,10 @@ class BRITS(BaseNNClassifier):
         }
         return inputs
 
-    def _assemble_input_for_validating(self, data: dict) -> dict:
+    def _assemble_input_for_validating(self, data: list) -> dict:
         return self._assemble_input_for_training(data)
 
-    def _assemble_input_for_testing(self, data: dict) -> dict:
+    def _assemble_input_for_testing(self, data: list) -> dict:
         # fetch data
         (
             indices,
@@ -299,51 +222,75 @@ class BRITS(BaseNNClassifier):
         self,
         train_set: Union[dict, str],
         val_set: Optional[Union[dict, str]] = None,
-        file_type: str = "h5py",
+        file_type: str = "hdf5",
     ) -> None:
         # Step 1: wrap the input data with classes Dataset and DataLoader
-        training_set = DatasetForBRITS(train_set, file_type=file_type)
-        training_loader = DataLoader(
-            training_set,
+        train_dataset = DatasetForBRITS(
+            train_set,
+            return_X_ori=False,
+            return_y=True,
+            file_type=file_type,
+        )
+        train_dataloader = DataLoader(
+            train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
         )
-        val_loader = None
+        val_dataloader = None
         if val_set is not None:
-            val_set = DatasetForBRITS(val_set, file_type=file_type)
-            val_loader = DataLoader(
-                val_set,
+            val_dataset = DatasetForBRITS(
+                train_set,
+                return_X_ori=False,
+                return_y=True,
+                file_type=file_type,
+            )
+            val_dataloader = DataLoader(
+                val_dataset,
                 batch_size=self.batch_size,
                 shuffle=False,
                 num_workers=self.num_workers,
             )
 
         # Step 2: train the model and freeze it
-        self._train_model(training_loader, val_loader)
+        self._train_model(train_dataloader, val_dataloader)
         self.model.load_state_dict(self.best_model_dict)
-        self.model.eval()  # set the model as eval status to freeze it.
 
         # Step 3: save the model if necessary
-        self._auto_save_model_if_necessary(training_finished=True)
+        self._auto_save_model_if_necessary(confirm_saving=self.model_saving_strategy == "best")
 
-    def classify(self, X: Union[dict, str], file_type: str = "h5py"):
-        self.model.eval()  # set the model as eval status to freeze it.
-        test_set = DatasetForBRITS(X, return_labels=False, file_type=file_type)
-        test_loader = DataLoader(
+    @torch.no_grad()
+    def predict(
+        self,
+        test_set: Union[dict, str],
+        file_type: str = "hdf5",
+    ) -> dict:
+        self.model.eval()  # set the model to evaluation mode
+
+        # Step 1: wrap the input data with classes Dataset and DataLoader
+        test_dataset = DatasetForBRITS(
             test_set,
+            return_X_ori=False,
+            return_y=False,
+            file_type=file_type,
+        )
+        test_dataloader = DataLoader(
+            test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
         )
-        prediction_collector = []
 
-        with torch.no_grad():
-            for idx, data in enumerate(test_loader):
-                inputs = self._assemble_input_for_testing(data)
-                results = self.model.forward(inputs, training=False)
-                classification_pred = results["classification_pred"]
-                prediction_collector.append(classification_pred)
+        # Step 2: process the data with the model
+        dict_result_collector = []
+        for idx, data in enumerate(test_dataloader):
+            inputs = self._assemble_input_for_testing(data)
+            results = self.model(inputs)
+            dict_result_collector.append(results)
 
-        predictions = torch.cat(prediction_collector)
-        return predictions.cpu().detach().numpy()
+        # Step 3: output collection and return
+        result_dict = gather_listed_dicts(dict_result_collector)
+        classification = np.argmax(result_dict["classification_proba"], axis=1)
+        result_dict["classification"] = classification
+
+        return result_dict

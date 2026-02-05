@@ -1,47 +1,28 @@
 """
 The implementation of YourNewModel for the partially-observed time-series imputation task.
 
-Refer to the paper "Your paper citation".
+TODO: modify the above description with your model's information.
 
 """
 
 # Created by Your Name <Your contact email> TODO: modify the author information.
-# License: GLP-v3
+# License: BSD-3-Clause
 
 from typing import Union, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
+
+from .core import _YourNewModel
 
 # TODO: import the base class from the imputation package in PyPOTS.
 #  Here I suppose this is a neural-network imputation model.
 #  You should make your model inherent BaseImputer if it is not a NN.
 # from ..base import BaseImputer
 from ..base import BaseNNImputer
-
+from ...nn.modules.loss import Criterion, MAE, MSE
 from ...optim.adam import Adam
 from ...optim.base import Optimizer
-
-
-# TODO: define your new model here.
-#  It could be a neural network model or a non-neural network algorithm (e.g. written in numpy).
-#  Your model should be implemented with PyTorch and subclass torch.nn.Module if it is a neural network.
-#  Note that your main algorithm is defined in this class, and this class usually won't be exposed to users.
-class _YourNewModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, inputs: dict) -> dict:
-        # TODO: define your model's forward propagation process here.
-        #  The input is a dict, and the output `results` should also be a dict.
-        #  `results` must contains the key `loss` which is will be used for backward propagation to update the model.
-
-        loss = None
-        results = {
-            "loss": loss,
-        }
-        return results
 
 
 # TODO: define your new model's wrapper here.
@@ -51,35 +32,47 @@ class _YourNewModel(nn.Module):
 class YourNewModel(BaseNNImputer):
     def __init__(
         self,
-        # TODO: add your model's hyper-parameters here
-        batch_size: int,
-        epochs: int,
-        patience: int,
+        # TODO: add your model's hyperparameters here
+        batch_size: int = 32,
+        epochs: int = 100,
+        patience: Optional[int] = None,
+        training_loss: Union[Criterion, type] = MAE,
+        validation_metric: Union[Criterion, type] = MSE,
+        optimizer: Union[Optimizer, type] = Adam,
         num_workers: int = 0,
-        optimizer: Optional[Optimizer] = Adam(),
         device: Optional[Union[str, torch.device, list]] = None,
-        saving_path: str = None,
+        saving_path: Optional[str] = None,
         model_saving_strategy: Optional[str] = "best",
+        verbose: bool = True,
     ):
         super().__init__(
-            batch_size,
-            epochs,
-            patience,
-            num_workers,
-            device,
-            saving_path,
-            model_saving_strategy,
+            training_loss=training_loss,
+            validation_metric=validation_metric,
+            batch_size=batch_size,
+            epochs=epochs,
+            patience=patience,
+            num_workers=num_workers,
+            device=device,
+            saving_path=saving_path,
+            model_saving_strategy=model_saving_strategy,
+            verbose=verbose,
         )
-        # set up the hyper-parameters
-        # TODO: set up your model's hyper-parameters here
+        # set up the hyperparameters
+        # TODO: set up your model's hyperparameters here
 
         # set up the model
-        self.model = _YourNewModel()
-        self.model = self.model.to(self.device)
+        self.model = _YourNewModel(
+            # pass the arguments to your model
+        )
         self._print_model_size()
+        self._send_model_to_given_device()
 
         # set up the optimizer
-        self.optimizer = optimizer
+        if isinstance(optimizer, Optimizer):
+            self.optimizer = optimizer
+        else:
+            self.optimizer = optimizer()  # instantiate the optimizer if it is a class
+            assert isinstance(self.optimizer, Optimizer)
         self.optimizer.init_optimizer(self.model.parameters())
 
     def _assemble_input_for_training(self, data: list) -> dict:
@@ -95,9 +88,20 @@ class YourNewModel(BaseNNImputer):
         self,
         train_set: Union[dict, str],
         val_set: Optional[Union[dict, str]] = None,
-        file_type: str = "h5py",
+        file_type: str = "hdf5",
     ) -> None:
         raise NotImplementedError
 
-    def impute(self, X: Union[dict, str], file_type: str = "h5py") -> np.ndarray:
+    def predict(
+        self,
+        test_set: Union[dict, str],
+        file_type: str = "hdf5",
+    ) -> dict:
+        raise NotImplementedError
+
+    def impute(
+        self,
+        test_set: Union[dict, str],
+        file_type: str = "hdf5",
+    ) -> np.ndarray:
         raise NotImplementedError

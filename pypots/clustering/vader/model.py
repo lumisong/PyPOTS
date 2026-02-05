@@ -1,269 +1,34 @@
 """
 The implementation of VaDER for the partially-observed time-series clustering task.
 
-Refer to the paper "Jong, J.D., Emon, M.A., Wu, P., Karki, R., Sood, M., Godard, P., Ahmad, A., Vrooman, H.A.,
-Hofmann-Apitius, M., & Fröhlich, H. (2019).
-Deep learning for clustering of multivariate clinical patient trajectories with missing values. GigaScience."
-
 """
 
 # Created by Wenjie Du <wenjay.du@gmail.com>
-# License: GLP-v3
+# License: BSD-3-Clause
 
 
-from typing import Tuple, Union, Optional
+import os
+from copy import deepcopy
+from typing import Union, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 from scipy.stats import multivariate_normal
 from sklearn.mixture import GaussianMixture
 from torch.utils.data import DataLoader
 
+from .core import inverse_softplus, _VaDER
 from .data import DatasetForVaDER
-from .modules import (
-    inverse_softplus,
-    GMMLayer,
-    PeepholeLSTMCell,
-    ImplicitImputation,
-)
 from ..base import BaseNNClusterer
+from ...nn.modules.loss import Criterion
 from ...optim.adam import Adam
 from ...optim.base import Optimizer
 from ...utils.logging import logger
-from ...utils.metrics import cal_mse
 
-
-class _VaDER(nn.Module):
-    """
-
-    Parameters
-    ----------
-    n_steps :
-    d_input :
-    n_clusters :
-    d_rnn_hidden :
-    d_mu_stddev :
-    eps :
-    alpha :
-        Weight of the latent loss.
-        The final loss = `alpha`*latent loss + reconstruction loss
-
-
-    Attributes
-    ----------
-
-    """
-
-    def __init__(
-        self,
-        n_steps: int,
-        d_input: int,
-        n_clusters: int,
-        d_rnn_hidden: int,
-        d_mu_stddev: int,
-        eps: float = 1e-9,
-        alpha: float = 1.0,
-    ):
-        super().__init__()
-        self.n_steps = n_steps
-        self.d_input = d_input
-        self.n_clusters = n_clusters
-        self.d_rnn_hidden = d_rnn_hidden
-        self.d_mu_stddev = d_mu_stddev
-        self.eps = eps
-        self.alpha = alpha
-
-        # building model components
-        self.implicit_imputation_layer = ImplicitImputation(d_input)
-        self.encoder = PeepholeLSTMCell(d_input, d_rnn_hidden)
-        self.decoder = PeepholeLSTMCell(d_input, d_rnn_hidden)
-        self.ae_encode_layers = nn.Sequential(
-            nn.Linear(d_rnn_hidden, d_rnn_hidden), nn.Softplus()
-        )
-        self.ae_decode_layers = nn.Sequential(
-            nn.Linear(d_mu_stddev, d_rnn_hidden), nn.Softplus()
-        )
-        self.mu_layer = nn.Linear(d_rnn_hidden, d_mu_stddev)  # layer for mean
-        self.stddev_layer = nn.Linear(
-            d_rnn_hidden, d_mu_stddev
-        )  # layer for standard variance
-        self.rnn_transform_layer = nn.Linear(d_rnn_hidden, d_input)
-        self.gmm_layer = GMMLayer(d_mu_stddev, n_clusters)
-
-    @staticmethod
-    def z_sampling(
-        mu_tilde: torch.Tensor,
-        stddev_tilde: torch.Tensor,
-    ) -> torch.Tensor:
-        noise = mu_tilde.data.new(mu_tilde.size()).normal_()
-        z = torch.add(mu_tilde, torch.exp(0.5 * stddev_tilde) * noise)
-        return z
-
-    def encode(
-        self,
-        X: torch.Tensor,
-        missing_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size = X.size(0)
-
-        X_imputed = self.implicit_imputation_layer(X, missing_mask)
-
-        hidden_state = torch.zeros(
-            (batch_size, self.d_rnn_hidden), dtype=X.dtype, device=X.device
-        )
-        cell_state = torch.zeros(
-            (batch_size, self.d_rnn_hidden), dtype=X.dtype, device=X.device
-        )
-        # cell_state_collector = torch.empty((batch_size, self.n_steps, self.d_rnn_hidden),
-        #                                    dtype=X.dtype, device=X.device)
-        for i in range(self.n_steps):
-            x = X_imputed[:, i, :]
-            hidden_state, cell_state = self.encoder(x, (hidden_state, cell_state))
-            # cell_state_collector[:, i, :] = cell_state
-
-        cell_state_collector = self.ae_encode_layers(cell_state)
-        mu_tilde = self.mu_layer(cell_state_collector)
-        stddev_tilde = self.stddev_layer(cell_state_collector)
-        z = self.z_sampling(mu_tilde, stddev_tilde)
-        return z, mu_tilde, stddev_tilde
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        hidden_state = z
-        hidden_state = self.ae_decode_layers(hidden_state)
-
-        cell_state = torch.zeros(hidden_state.size(), dtype=z.dtype, device=z.device)
-        inputs = torch.zeros(
-            (z.size(0), self.n_steps, self.d_input), dtype=z.dtype, device=z.device
-        )
-
-        hidden_state_collector = torch.empty(
-            (z.size(0), self.n_steps, self.d_rnn_hidden), dtype=z.dtype, device=z.device
-        )
-        for i in range(self.n_steps):
-            x = inputs[:, i, :]
-            hidden_state, cell_state = self.decoder(x, (hidden_state, cell_state))
-            hidden_state_collector[:, i, :] = hidden_state
-
-        reconstruction = self.rnn_transform_layer(hidden_state_collector)
-        return reconstruction
-
-    def get_results(
-        self, X: torch.Tensor, missing_mask: torch.Tensor
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        z, mu_tilde, stddev_tilde = self.encode(X, missing_mask)
-        X_reconstructed = self.decode(z)
-        mu_c, var_c, phi_c = self.gmm_layer()
-        return X_reconstructed, mu_c, var_c, phi_c, z, mu_tilde, stddev_tilde
-
-    def forward(
-        self,
-        inputs: dict,
-        pretrain: bool = False,
-        training: bool = True,
-    ) -> dict:
-        X, missing_mask = inputs["X"], inputs["missing_mask"]
-        device = X.device
-
-        (
-            X_reconstructed,
-            mu_c,
-            var_c,
-            phi_c,
-            z,
-            mu_tilde,
-            stddev_tilde,
-        ) = self.get_results(X, missing_mask)
-
-        if not training and not pretrain:
-
-            results = {
-                "mu_tilde": mu_tilde,
-                "mu": mu_c,
-                "var": var_c,
-                "phi": phi_c,
-            }
-            # if only run clustering, then no need to calculate loss
-            return results
-
-        # calculate the reconstruction loss
-        unscaled_reconstruction_loss = cal_mse(X_reconstructed, X, missing_mask)
-        reconstruction_loss = (
-            unscaled_reconstruction_loss
-            * self.n_steps
-            * self.d_input
-            / missing_mask.sum()
-        )
-        if pretrain:
-            results = {"loss": reconstruction_loss, "z": z}
-            return results
-
-        # calculate the latent loss
-        var_tilde = torch.exp(stddev_tilde)
-        stddev_c = torch.log(var_c + self.eps)
-        log_2pi = torch.log(torch.tensor([2 * torch.pi], device=device))
-        log_phi_c = torch.log(phi_c + self.eps)
-
-        batch_size = z.shape[0]
-
-        ii, jj = torch.meshgrid(
-            torch.arange(self.n_clusters, dtype=torch.int64, device=device),
-            torch.arange(batch_size, dtype=torch.int64, device=device),
-            indexing="ij",
-        )
-        ii = ii.flatten()
-        jj = jj.flatten()
-
-        lsc_b = stddev_c.index_select(dim=0, index=ii)
-        mc_b = mu_c.index_select(dim=0, index=ii)
-        sc_b = var_c.index_select(dim=0, index=ii)
-        z_b = z.index_select(dim=0, index=jj)
-        log_pdf_z = -0.5 * (lsc_b + log_2pi + torch.square(z_b - mc_b) / sc_b)
-        log_pdf_z = log_pdf_z.reshape([batch_size, self.n_clusters, self.d_mu_stddev])
-
-        log_p = log_phi_c + log_pdf_z.sum(dim=2)
-        lse_p = log_p.logsumexp(dim=1, keepdim=True)
-        log_gamma_c = log_p - lse_p
-        gamma_c = torch.exp(log_gamma_c)
-
-        term1 = torch.log(var_c + self.eps)
-        st_b = var_tilde.index_select(dim=0, index=jj)
-        sc_b = var_c.index_select(dim=0, index=ii)
-        term2 = torch.reshape(
-            st_b / (sc_b + self.eps), [batch_size, self.n_clusters, self.d_mu_stddev]
-        )
-        mt_b = mu_tilde.index_select(dim=0, index=jj)
-        mc_b = mu_c.index_select(dim=0, index=ii)
-        term3 = torch.reshape(
-            torch.square(mt_b - mc_b) / (sc_b + self.eps),
-            [batch_size, self.n_clusters, self.d_mu_stddev],
-        )
-
-        latent_loss1 = 0.5 * torch.sum(
-            gamma_c * torch.sum(term1 + term2 + term3, dim=2), dim=1
-        )
-        latent_loss2 = -torch.sum(gamma_c * (log_phi_c - log_gamma_c), dim=1)
-        latent_loss3 = -0.5 * torch.sum(1 + stddev_tilde, dim=1)
-
-        latent_loss1 = latent_loss1.mean()
-        latent_loss2 = latent_loss2.mean()
-        latent_loss3 = latent_loss3.mean()
-        latent_loss = latent_loss1 + latent_loss2 + latent_loss3
-
-        results = {
-            "loss": reconstruction_loss + self.alpha * latent_loss,
-            "z": z,
-        }
-
-        return results
+try:
+    import nni
+except ImportError:
+    pass
 
 
 class VaDER(BaseNNClusterer):
@@ -303,6 +68,7 @@ class VaDER(BaseNNClusterer):
     optimizer :
         The optimizer for model training.
         If not given, will use a default Adam optimizer.
+
     num_workers :
         The number of subprocesses to use for data loading.
         `0` means data loading will be in the main process, i.e. there won't be subprocesses.
@@ -318,20 +84,15 @@ class VaDER(BaseNNClusterer):
         training into a tensorboard file). Will not save if not given.
 
     model_saving_strategy :
-        The strategy to save model checkpoints. It has to be one of [None, "best", "better"].
+        The strategy to save model checkpoints. It has to be one of [None, "best", "better", "all"].
         No model will be saved when it is set as None.
         The "best" strategy will only automatically save the best model after the training finished.
         The "better" strategy will automatically save the model during training whenever the model performs
         better than in previous epochs.
+        The "all" strategy will save every model after each epoch training.
 
-    Attributes
-    ----------
-    model : :class:`torch.nn.Module`
-        The underlying VaDER model.
-
-    optimizer : :class:`pypots.optim.Optimizer`
-        The optimizer for model training.
-
+    verbose :
+        Whether to print out the training logs during the training process.
     """
 
     def __init__(
@@ -344,41 +105,45 @@ class VaDER(BaseNNClusterer):
         batch_size: int = 32,
         epochs: int = 100,
         pretrain_epochs: int = 10,
-        patience: int = None,
-        optimizer: Optional[Optimizer] = Adam(),
+        patience: Optional[int] = None,
+        optimizer: Union[Optimizer, type] = Adam,
         num_workers: int = 0,
         device: Optional[Union[str, torch.device, list]] = None,
         saving_path: str = None,
         model_saving_strategy: Optional[str] = "best",
+        verbose: bool = True,
     ):
         super().__init__(
-            n_clusters,
-            batch_size,
-            epochs,
-            patience,
-            num_workers,
-            device,
-            saving_path,
-            model_saving_strategy,
+            n_clusters=n_clusters,
+            training_loss=Criterion,
+            validation_metric=Criterion,
+            batch_size=batch_size,
+            epochs=epochs,
+            patience=patience,
+            num_workers=num_workers,
+            device=device,
+            saving_path=saving_path,
+            model_saving_strategy=model_saving_strategy,
+            verbose=verbose,
         )
 
-        assert (
-            pretrain_epochs > 0
-        ), f"pretrain_epochs must be a positive integer, but got {pretrain_epochs}"
+        assert pretrain_epochs > 0, f"pretrain_epochs must be a positive integer, but got {pretrain_epochs}"
 
         self.n_steps = n_steps
         self.n_features = n_features
         self.pretrain_epochs = pretrain_epochs
 
         # set up the model
-        self.model = _VaDER(
-            n_steps, n_features, n_clusters, rnn_hidden_size, d_mu_stddev
-        )
+        self.model = _VaDER(n_steps, n_features, n_clusters, rnn_hidden_size, d_mu_stddev)
         self._send_model_to_given_device()
         self._print_model_size()
 
         # set up the optimizer
-        self.optimizer = optimizer
+        if isinstance(optimizer, Optimizer):
+            self.optimizer = optimizer
+        else:
+            self.optimizer = optimizer()  # instantiate the optimizer if it is a class
+            assert isinstance(self.optimizer, Optimizer)
         self.optimizer.init_optimizer(self.model.parameters())
 
     def _assemble_input_for_training(self, data: list) -> dict:
@@ -400,38 +165,40 @@ class VaDER(BaseNNClusterer):
 
     def _train_model(
         self,
-        training_loader: DataLoader,
-        val_loader: DataLoader = None,
+        train_dataloader: DataLoader,
+        val_dataloader: DataLoader = None,
     ) -> None:
-
         # each training starts from the very beginning, so reset the loss and model dict here
-        self.best_loss = float("inf")
         self.best_model_dict = None
+
+        if self.validation_metric.lower_better:
+            self.best_loss = float("inf")
+        else:
+            self.best_loss = float("-inf")
 
         # pretrain to initialize parameters of GMM layer
         pretraining_step = 0
         for epoch in range(self.pretrain_epochs):
             self.model.train()
-            for idx, data in enumerate(training_loader):
+            for idx, data in enumerate(train_dataloader):
                 pretraining_step += 1
                 inputs = self._assemble_input_for_training(data)
                 self.optimizer.zero_grad()
-                results = self.model.forward(inputs, pretrain=True)
-                results["loss"].sum().backward()
+                results = self.model(inputs, pretrain=True)
+                loss = results["loss"].sum()
+                loss.backward()
                 self.optimizer.step()
 
                 # save pre-training loss logs into the tensorboard file for every step if in need
                 if self.summary_writer is not None:
-                    self._save_log_into_tb_file(
-                        pretraining_step, "pretraining", results
-                    )
+                    self._save_log_into_tb_file(pretraining_step, "pretraining", results)
 
         with torch.no_grad():
             sample_collector = []
             for _ in range(10):  # sampling 10 times
-                for idx, data in enumerate(training_loader):
+                for idx, data in enumerate(train_dataloader):
                     inputs = self._assemble_input_for_validating(data)
-                    results = self.model.forward(inputs, pretrain=True)
+                    results = self.model(inputs, pretrain=True)
                     sample_collector.append(results["z"])
             samples = torch.cat(sample_collector).cpu().detach().numpy()
 
@@ -452,19 +219,17 @@ class VaDER(BaseNNClusterer):
                     gmm.fit(samples)
                     flag = 1
                 except ValueError as e:
-                    logger.error(e)
-                    logger.warning(
-                        "Met with ValueError, double `reg_covar` to re-train the GMM model."
-                    )
+                    logger.error(f"❌ Exception: {e}")
+                    logger.warning("‼️ Met with ValueError, double `reg_covar` to re-train the GMM model.")
 
                     flag -= 1
                     if flag == -5:
                         logger.error(
-                            f"Doubled `reg_covar` for 4 times, whose current value is {reg_covar}, but still failed.\n"
-                            "Now quit to let you check your model training.\n"
+                            f"❌ Doubled `reg_covar` for 4 times, its current value is {reg_covar}, but still failed.\n"
+                            f"Now quit to let you check your model training.\n"
                             "Please raise an issue https://github.com/WenjieDu/PyPOTS/issues if you have questions."
                         )
-                        exit()
+                        raise RuntimeError
                     else:
                         reg_covar *= 2
 
@@ -478,13 +243,13 @@ class VaDER(BaseNNClusterer):
 
             # use trained GMM's parameters to init GMM layer's
             if isinstance(self.device, list):  # if using multi-GPU
-                self.model.module.gmm_layer.set_values(
+                self.model.module.backbone.gmm_layer.set_values(
                     torch.from_numpy(mu).to(device),
                     torch.from_numpy(var).to(device),
                     torch.from_numpy(phi).to(device),
                 )
             else:
-                self.model.gmm_layer.set_values(
+                self.model.backbone.gmm_layer.set_values(
                     torch.from_numpy(mu).to(device),
                     torch.from_numpy(var).to(device),
                     torch.from_numpy(phi).to(device),
@@ -492,17 +257,18 @@ class VaDER(BaseNNClusterer):
 
         try:
             training_step = 0
-            for epoch in range(self.epochs):
+            for epoch in range(1, self.epochs + 1):
                 self.model.train()
                 epoch_train_loss_collector = []
-                for idx, data in enumerate(training_loader):
+                for idx, data in enumerate(train_dataloader):
                     training_step += 1
                     inputs = self._assemble_input_for_training(data)
                     self.optimizer.zero_grad()
-                    results = self.model.forward(inputs)
-                    results["loss"].sum().backward()
+                    results = self.model(inputs)
+                    loss = results["loss"].sum()
+                    loss.backward()
                     self.optimizer.step()
-                    epoch_train_loss_collector.append(results["loss"].sum().item())
+                    epoch_train_loss_collector.append(loss.item())
 
                     # save training loss logs into the tensorboard file for every step if in need
                     if self.summary_writer is not None:
@@ -511,20 +277,19 @@ class VaDER(BaseNNClusterer):
                 # mean training loss of the current epoch
                 mean_train_loss = np.mean(epoch_train_loss_collector)
 
-                if val_loader is not None:
+                if val_dataloader is not None:
                     self.model.eval()
                     epoch_val_loss_collector = []
                     with torch.no_grad():
-                        for idx, data in enumerate(val_loader):
+                        for idx, data in enumerate(val_dataloader):
                             inputs = self._assemble_input_for_validating(data)
-                            results = self.model.forward(inputs)
-                            epoch_val_loss_collector.append(
-                                results["loss"].sum().item()
-                            )
+                            results = self.model(inputs)
+                            loss = results["loss"]
+                            epoch_val_loss_collector.append(loss.sum().item())
 
                     mean_val_loss = np.mean(epoch_val_loss_collector)
 
-                    # save validating loss logs into the tensorboard file for every epoch if in need
+                    # save validation loss logs into the tensorboard file for every epoch if in need
                     if self.summary_writer is not None:
                         val_loss_dict = {
                             "loss": mean_val_loss,
@@ -532,34 +297,48 @@ class VaDER(BaseNNClusterer):
                         self._save_log_into_tb_file(epoch, "validating", val_loss_dict)
 
                     logger.info(
-                        f"epoch {epoch}: "
-                        f"training loss {mean_train_loss:.4f}, "
-                        f"validating loss {mean_val_loss:.4f}"
+                        f"Epoch {epoch:03d} - "
+                        f"training loss ({self.training_loss_name}): {mean_train_loss:.4f}, "
+                        f"validation {self.validation_metric_name}: {mean_val_loss:.4f}"
                     )
                     mean_loss = mean_val_loss
                 else:
-                    logger.info(f"epoch {epoch}: training loss {mean_train_loss:.4f}")
+                    logger.info(f"Epoch {epoch:03d} - training loss ({self.training_loss_name}): {mean_train_loss:.4f}")
                     mean_loss = mean_train_loss
 
-                if mean_loss < self.best_loss:
+                if np.isnan(mean_loss):
+                    logger.warning(f"‼️ Attention: got NaN loss in Epoch {epoch}. This may lead to unexpected errors.")
+
+                if (self.validation_metric.lower_better and mean_loss < self.best_loss) or (
+                    not self.validation_metric.lower_better and mean_loss > self.best_loss
+                ):
+                    self.best_epoch = epoch
                     self.best_loss = mean_loss
-                    self.best_model_dict = self.model.state_dict()
+                    self.best_model_dict = deepcopy(self.model.state_dict())
                     self.patience = self.original_patience
-                    # save the model if necessary
-                    self._auto_save_model_if_necessary(
-                        training_finished=False,
-                        saving_name=f"{self.__class__.__name__}_epoch{epoch}_loss{mean_loss}",
-                    )
                 else:
                     self.patience -= 1
-                    if self.patience == 0:
-                        logger.info(
-                            "Exceeded the training patience. Terminating the training procedure..."
-                        )
-                        break
-        except Exception as e:
-            logger.error(f"Exception: {e}")
-            if self.best_model_dict is None:
+
+                # save the model if necessary
+                self._auto_save_model_if_necessary(
+                    confirm_saving=self.best_epoch == epoch and self.model_saving_strategy == "better",
+                    saving_name=f"{self.__class__.__name__}_epoch{epoch}_{self.validation_metric_name}{mean_loss:.4f}",
+                )
+
+                if os.getenv("ENABLE_HPO", False):
+                    nni.report_intermediate_result(mean_loss)
+                    if epoch == self.epochs - 1 or self.patience == 0:
+                        nni.report_final_result(self.best_loss)
+
+                if self.patience == 0:
+                    logger.info("Exceeded the training patience. Terminating the training procedure...")
+                    break
+
+        except KeyboardInterrupt:  # if keyboard interrupt, only warning
+            logger.warning("‼️ Training got interrupted by the user. Exist now ...")
+        except Exception as e:  # other kind of exception follows below processing
+            logger.error(f"❌ Exception: {e}")
+            if self.best_model_dict is None:  # if no best model, raise error
                 raise RuntimeError(
                     "Training got interrupted. Model was not trained. Please investigate the error printed above."
                 )
@@ -570,76 +349,143 @@ class VaDER(BaseNNClusterer):
                     "If you don't want it, please try fit() again."
                 )
 
-        if np.equal(self.best_loss, float("inf")):
-            raise ValueError("Something is wrong. best_loss is Nan after training.")
+        if np.isnan(self.best_loss) or self.best_loss.__eq__(float("inf")):
+            raise ValueError("Something is wrong. best_loss is Nan/Inf after training.")
 
-        logger.info("Finished training.")
+        logger.info(f"Finished training. The best model is from epoch#{self.best_epoch}.")
 
     def fit(
         self,
         train_set: Union[dict, str],
-        file_type: str = "h5py",
+        val_set: Optional[Union[dict, str]] = None,
+        file_type: str = "hdf5",
     ) -> None:
         # Step 1: wrap the input data with classes Dataset and DataLoader
-        training_set = DatasetForVaDER(
-            train_set, return_labels=False, file_type=file_type
-        )
-        training_loader = DataLoader(
-            training_set,
+        train_dataset = DatasetForVaDER(train_set, return_y=False, file_type=file_type)
+        train_dataloader = DataLoader(
+            train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
         )
 
+        val_dataloader = None
+        if val_set is not None:
+            val_dataset = DatasetForVaDER(val_set, return_y=False, file_type=file_type)
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+            )
+
         # Step 2: train the model and freeze it
-        self._train_model(training_loader)
+        self._train_model(train_dataloader, val_dataloader)
         self.model.load_state_dict(self.best_model_dict)
-        self.model.eval()  # set the model as eval status to freeze it.
 
         # Step 3: save the model if necessary
-        self._auto_save_model_if_necessary(training_finished=True)
+        self._auto_save_model_if_necessary(confirm_saving=self.model_saving_strategy == "best")
 
-    def cluster(self, X: Union[dict, str], file_type: str = "h5py") -> np.ndarray:
-        self.model.eval()  # set the model as eval status to freeze it.
-        test_set = DatasetForVaDER(X, return_labels=False, file_type=file_type)
-        test_loader = DataLoader(
+    @torch.no_grad()
+    def predict(
+        self,
+        test_set: Union[dict, str],
+        file_type: str = "hdf5",
+        return_latent_vars: bool = False,
+    ) -> dict:
+        """Make predictions for the input data with the trained model.
+
+        Parameters
+        ----------
+        test_set :
+            The test dataset for model to process, should be a dictionary including keys as 'X',
+            or a path string locating a data file supported by PyPOTS (e.g. h5 file).
+            If it is a dict, X should be array-like with shape [n_samples, n_steps, n_features],
+            which is the time-series data for processing.
+            If it is a path string, the path should point to a data file, e.g. a h5 file, which contains
+            key-value pairs like a dict, and it has to include 'X' key.
+
+        file_type :
+            The type of the given file if test_set is a path string.
+
+        return_latent_vars : bool
+            Whether to return the latent variables in VaDER, e.g. mu and phi, etc.
+
+        Returns
+        -------
+        result_dict :
+            The dictionary containing the clustering results as key 'clustering' and latent variables if necessary.
+        """
+        self.model.eval()  # set the model to evaluation mode
+        test_dataset = DatasetForVaDER(
             test_set,
+            return_y=False,
+            file_type=file_type,
+        )
+        test_dataloader = DataLoader(
+            test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
         )
+        mu_tilde_collector = []
+        stddev_tilde_collector = []
+        mu_collector = []
+        var_collector = []
+        phi_collector = []
+        z_collector = []
+        imputation_latent_collector = []
         clustering_results_collector = []
 
-        with torch.no_grad():
-            for idx, data in enumerate(test_loader):
-                inputs = self._assemble_input_for_testing(data)
-                results = self.model.forward(inputs, training=False)
+        def func_to_apply(
+            mu_t_: np.ndarray,
+            mu_: np.ndarray,
+            stddev_: np.ndarray,
+            phi_: np.ndarray,
+        ) -> np.ndarray:
+            # the covariance matrix is diagonal, so we can just take the product
+            return np.log(1e-9 + phi_) + np.log(1e-9 + multivariate_normal.pdf(mu_t_, mean=mu_, cov=np.diag(stddev_)))
 
-                mu_tilde = results["mu_tilde"].cpu().numpy()
-                mu = results["mu"].cpu().numpy()
-                var = results["var"].cpu().numpy()
-                phi = results["phi"].cpu().numpy()
+        for idx, data in enumerate(test_dataloader):
+            inputs = self._assemble_input_for_testing(data)
+            results = self.model(inputs)
 
-                def func_to_apply(
-                    mu_t_: np.ndarray,
-                    mu_: np.ndarray,
-                    stddev_: np.ndarray,
-                    phi_: np.ndarray,
-                ) -> np.ndarray:
-                    # the covariance matrix is diagonal, so we can just take the product
-                    return np.log(1e-9 + phi_) + np.log(
-                        1e-9
-                        + multivariate_normal.pdf(mu_t_, mean=mu_, cov=np.diag(stddev_))
-                    )
+            mu_tilde = results["mu_tilde"].cpu().numpy()
+            mu_tilde_collector.append(mu_tilde)
+            mu = results["mu"].cpu().numpy()
+            mu_collector.append(mu)
+            var = results["var"].cpu().numpy()
+            var_collector.append(var)
+            phi = results["phi"].cpu().numpy()
+            phi_collector.append(phi)
 
-                p = np.array(
-                    [
-                        func_to_apply(mu_tilde, mu[i], var[i], phi[i])
-                        for i in np.arange(mu.shape[0])
-                    ]
-                )
-                clustering_results = np.argmax(p, axis=0)
-                clustering_results_collector.append(clustering_results)
+            p = np.array([func_to_apply(mu_tilde, mu[i], var[i], phi[i]) for i in np.arange(mu.shape[0])])
+            clustering_results = np.argmax(p, axis=0)
+            clustering_results_collector.append(clustering_results)
 
-        clustering_results = np.concatenate(clustering_results_collector)
-        return clustering_results
+            if return_latent_vars:
+                stddev_tilde = results["stddev_tilde"].cpu().numpy()
+                stddev_tilde_collector.append(stddev_tilde)
+                z = results["z"].cpu().numpy()
+                z_collector.append(z)
+                imputation_latent = results["imputation_latent"].cpu().numpy()
+                imputation_latent_collector.append(imputation_latent)
+
+        clustering = np.concatenate(clustering_results_collector)
+        result_dict = {
+            "clustering": clustering,
+        }
+
+        if return_latent_vars:
+            latent_var_collector = {
+                "mu_tilde": np.concatenate(mu_tilde_collector),
+                "stddev_tilde": np.concatenate(stddev_tilde_collector),
+                "mu": np.concatenate(mu_collector),
+                "var": np.concatenate(var_collector),
+                "phi": np.concatenate(phi_collector),
+                "z": np.concatenate(z_collector),
+                "imputation_latent": np.concatenate(imputation_latent_collector),
+            }
+            result_dict["latent_vars"] = latent_var_collector
+
+        return result_dict

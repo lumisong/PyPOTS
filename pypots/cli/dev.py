@@ -3,7 +3,7 @@ CLI tools to help the development team build PyPOTS.
 """
 
 # Created by Wenjie Du <wenjay.du@gmail.com>
-# License: GLP-v3
+# License: BSD-3-Clause
 
 import os
 import shutil
@@ -131,10 +131,9 @@ class DevCommand(BaseCommand):
             )
 
         if self._cleanup:
-            assert not self._run_tests and not self._lint_code, (
-                "Argument `--cleanup` should be used alone. "
-                "Try `pypots-cli dev --cleanup`"
-            )
+            assert (
+                not self._run_tests and not self._lint_code
+            ), "Argument `--cleanup` should be used alone. Try `pypots-cli dev --cleanup`"
 
     def run(self):
         """Execute the given command."""
@@ -147,16 +146,10 @@ class DevCommand(BaseCommand):
                 shutil.rmtree("dist", ignore_errors=True)
                 shutil.rmtree("pypots.egg-info", ignore_errors=True)
             elif self._build:
-                self.execute_command("python setup.py sdist bdist bdist_wheel")
+                self.execute_command("python -m build")
             elif self._run_tests:
-                pytest_command = (
-                    f"pytest -k {self._k}" if self._k is not None else "pytest"
-                )
-                command_to_run_test = (
-                    f"coverage run -m {pytest_command}"
-                    if self._show_coverage
-                    else pytest_command
-                )
+                pytest_command = f"pytest -k {self._k}" if self._k is not None else "pytest"
+                command_to_run_test = f"coverage run -m {pytest_command}" if self._show_coverage else pytest_command
                 self.execute_command(command_to_run_test)
                 if self._show_coverage and os.path.exists(".coverage"):
                     self.execute_command("coverage report -m")
